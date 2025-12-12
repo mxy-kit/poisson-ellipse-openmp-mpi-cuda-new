@@ -691,20 +691,25 @@ int gradient_solver_mpi(int M, int N, double delta, int max_iter,
     double h1 = (B1 - A1) / M;
     double h2 = (B2 - A2) / N;
     double eps = std::max(h1, h2) * std::max(h1, h2);
-
     double h1h2 = h1 * h2;
 
-    // 1) Build 2D process grid and compute local ranges
+    // timing accumulators
+    double time_gpu_total     = 0.0;
+    double time_copy_total    = 0.0;
+    double time_comm_total    = 0.0;
+    double time_precond_total = 0.0;  // now 0, CPU part removed
+    double time_dot_total     = 0.0;
+
+    // 2D process grid and local ranges
     int Px, Py;
     choose_process_grid(size, Px, Py);
 
     int i_start, i_end, j_start, j_end;
     decompose_2d(M, N, Px, Py, rank, i_start, i_end, j_start, j_end);
-
     int local_nx = i_end - i_start + 1;
     int local_ny = j_end - j_start + 1;
 
-    // 2) Allocate local arrays: size (local_nx+2) x (local_ny+2)
+    // assemble a, b, B on CPU
     Matrix a(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
     Matrix b(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
     Matrix B(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
@@ -715,71 +720,58 @@ int gradient_solver_mpi(int M, int N, double delta, int max_iter,
                                    j_start, j_end,
                                    local_nx, local_ny);
 
-    Matrix w(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
-    Matrix r = B;   // initial residual r = f - A w, w = 0 so r = f
-    Matrix z(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
-    Matrix p(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
-    Matrix Ap(local_nx + 2, std::vector<double>(local_ny + 2, 0.0));
-
-    // 3) GPU-related arrays (flattened)
     int pitch = local_ny + 2;
     int local_size = (local_nx + 2) * (local_ny + 2);
+    size_t bytes = static_cast<size_t>(local_size) * sizeof(double);
 
-    std::vector<double> h_a(local_size);
-    std::vector<double> h_b(local_size);
-    std::vector<double> h_p(local_size);
-    std::vector<double> h_Ap(local_size);
-    std::vector<double> h_r(local_size);
-    std::vector<double> h_z(local_size);
+    std::vector<double> h_a(local_size), h_b(local_size), h_B(local_size);
 
-    // Flatten a and b once and copy to device
     for (int li = 0; li <= local_nx + 1; ++li) {
         for (int lj = 0; lj <= local_ny + 1; ++lj) {
             int idx = li * pitch + lj;
             h_a[idx] = a[li][lj];
             h_b[idx] = b[li][lj];
+            h_B[idx] = B[li][lj];
         }
     }
 
-    double *d_a  = nullptr;
-    double *d_b  = nullptr;
-    double *d_p  = nullptr;
-    double *d_Ap = nullptr;
-    double *d_r  = nullptr;
-    double *d_z  = nullptr;
+    double *d_a  = nullptr, *d_b = nullptr, *d_B = nullptr;
+    double *d_w  = nullptr, *d_r = nullptr, *d_z = nullptr;
+    double *d_p  = nullptr, *d_Ap = nullptr;
 
-    size_t bytes = static_cast<size_t>(local_size) * sizeof(double);
+    checkCuda(cudaMalloc(&d_a,  bytes), "cudaMalloc d_a");
+    checkCuda(cudaMalloc(&d_b,  bytes), "cudaMalloc d_b");
+    checkCuda(cudaMalloc(&d_B,  bytes), "cudaMalloc d_B");
+    checkCuda(cudaMalloc(&d_w,  bytes), "cudaMalloc d_w");
+    checkCuda(cudaMalloc(&d_r,  bytes), "cudaMalloc d_r");
+    checkCuda(cudaMalloc(&d_z,  bytes), "cudaMalloc d_z");
+    checkCuda(cudaMalloc(&d_p,  bytes), "cudaMalloc d_p");
+    checkCuda(cudaMalloc(&d_Ap, bytes), "cudaMalloc d_Ap");
 
-    checkCuda(cudaMalloc((void**)&d_a,  bytes), "cudaMalloc d_a");
-    checkCuda(cudaMalloc((void**)&d_b,  bytes), "cudaMalloc d_b");
-    checkCuda(cudaMalloc((void**)&d_p,  bytes), "cudaMalloc d_p");
-    checkCuda(cudaMalloc((void**)&d_Ap, bytes), "cudaMalloc d_Ap");
-    checkCuda(cudaMalloc((void**)&d_r,  bytes), "cudaMalloc d_r");
-    checkCuda(cudaMalloc((void**)&d_z,  bytes), "cudaMalloc d_z");
-
+    // initial copies (count as solver copy time or init? 这里计入 solver copy)
+    double t_c0 = MPI_Wtime();
     checkCuda(cudaMemcpy(d_a, h_a.data(), bytes, cudaMemcpyHostToDevice),
-              "cudaMemcpy a H2D");
+              "copy a H2D");
     checkCuda(cudaMemcpy(d_b, h_b.data(), bytes, cudaMemcpyHostToDevice),
-              "cudaMemcpy b H2D");
+              "copy b H2D");
+    checkCuda(cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice),
+              "copy B H2D");
+    double t_c1 = MPI_Wtime();
+    time_copy_total += (t_c1 - t_c0);
 
-    // === dot product on GPU: partial buffer ===
-    const int DOT_BLOCKS  = 1;     // 可以调大一点
-    const int DOT_THREADS = 256;   // 每个 block 256 线程
+    // dot / diff partial arrays
+    const int DOT_BLOCKS  = 128;
+    const int DOT_THREADS = 256;
     const int DOT_PARTIAL = DOT_BLOCKS * DOT_THREADS;
 
     double *d_partial = nullptr;
-    checkCuda(cudaMalloc((void**)&d_partial,
-                         DOT_PARTIAL * sizeof(double)),
+    checkCuda(cudaMalloc(&d_partial, DOT_PARTIAL * sizeof(double)),
               "cudaMalloc d_partial");
+    std::vector<double> h_partial(DOT_PARTIAL);
 
-    std::vector<double> h_partial(DOT_PARTIAL, 0.0);
-
-    // helper lambda: dot on GPU, 返回 local dot (未 MPI_reduce)
-    auto dot_gpu = [&](const double* dx, const double* dy) -> double
-    {
-        dim3 block(DOT_THREADS);
+    auto dot_gpu = [&](const double* dx, const double* dy) -> double {
         dim3 grid(DOT_BLOCKS);
-
+        dim3 block(DOT_THREADS);
         dot_kernel<<<grid, block>>>(dx, dy, d_partial,
                                     local_nx, local_ny, h1h2);
         checkCuda(cudaGetLastError(), "dot_kernel launch");
@@ -788,84 +780,60 @@ int gradient_solver_mpi(int M, int N, double delta, int max_iter,
         checkCuda(cudaMemcpy(h_partial.data(), d_partial,
                              DOT_PARTIAL * sizeof(double),
                              cudaMemcpyDeviceToHost),
-                  "cudaMemcpy partial D2H");
-
+                  "copy partial D2H");
         double sum = 0.0;
-        for (int i = 0; i < DOT_PARTIAL; ++i) {
-            sum += h_partial[i];
-        }
+        for (int i = 0; i < DOT_PARTIAL; ++i) sum += h_partial[i];
         return sum;
     };
 
-    int iter = 0;
-
-    // Timing accumulators for GPU and copies
-    double time_gpu_total  = 0.0;
-    double time_copy_total = 0.0;
-
-    // Timing accumulators for communication and CPU-side work
-    double time_comm_total     = 0.0; // MPI halo exchange
-    double time_precond_total  = 0.0; // CPU part of preconditioner (matrix unpack)
-    double time_dot_total      = 0.0; // dot on GPU + copy partial + sum
-
-    // CUDA launch configuration (simple 2D grid)
-    dim3 blockDim(16, 16);
-    dim3 gridDim((local_nx + blockDim.x - 1) / blockDim.x,
-                 (local_ny + blockDim.y - 1) / blockDim.y);
-
-    // Lambda: apply D^{-1} r on GPU and measure time
-    auto apply_Dinv_gpu = [&](const Matrix &r_mat, Matrix &z_mat)
-    {
-        // 1) flatten r -> h_r
-        for (int li = 0; li <= local_nx + 1; ++li) {
-            for (int lj = 0; lj <= local_ny + 1; ++lj) {
-                int idx = li * pitch + lj;
-                h_r[idx] = r_mat[li][lj];
-            }
-        }
-
-        // 2) H2D copy for r
-        double t_h2d0 = MPI_Wtime();
-        checkCuda(cudaMemcpy(d_r, h_r.data(), bytes, cudaMemcpyHostToDevice),
-                  "cudaMemcpy r H2D (precond)");
-        double t_h2d1 = MPI_Wtime();
-        time_copy_total += (t_h2d1 - t_h2d0);
-
-        // 3) kernel: z = D^{-1} r
-        double t_k0 = MPI_Wtime();
-        apply_Dinv_kernel<<<gridDim, blockDim>>>(d_r, d_a, d_b, d_z,
-                                                 local_nx, local_ny, h1, h2);
-        checkCuda(cudaGetLastError(), "apply_Dinv_kernel launch");
-        checkCuda(cudaDeviceSynchronize(), "apply_Dinv_kernel sync");
-        double t_k1 = MPI_Wtime();
-        time_gpu_total += (t_k1 - t_k0);
-
-        // 4) D2H copy for z
-        double t_d2h0 = MPI_Wtime();
-        checkCuda(cudaMemcpy(h_z.data(), d_z, bytes, cudaMemcpyDeviceToHost),
-                  "cudaMemcpy z D2H (precond)");
-        double t_d2h1 = MPI_Wtime();
-        time_copy_total += (t_d2h1 - t_d2h0);
-
-        // 5) unpack interior part back to Matrix and count as precond CPU time
-        double t_cpu0 = MPI_Wtime();
-        for (int li = 1; li <= local_nx; ++li) {
-            for (int lj = 1; lj <= local_ny; ++lj) {
-                int idx = li * pitch + lj;
-                z_mat[li][lj] = h_z[idx];
-            }
-        }
-        double t_cpu1 = MPI_Wtime();
-        time_precond_total += (t_cpu1 - t_cpu0);
+    auto reduce_diff = [&](double* d_partial_diff) -> double {
+        checkCuda(cudaMemcpy(h_partial.data(), d_partial_diff,
+                             DOT_PARTIAL * sizeof(double),
+                             cudaMemcpyDeviceToHost),
+                  "copy diff partial D2H");
+        double sum = 0.0;
+        for (int i = 0; i < DOT_PARTIAL; ++i) sum += h_partial[i];
+        return sum;
     };
 
-    // 4) Apply preconditioner to the initial residual (GPU)
-    apply_Dinv_gpu(r, z);
+    dim3 block2D(16, 16);
+    dim3 grid2D((local_nx + block2D.x - 1) / block2D.x,
+                (local_ny + block2D.y - 1) / block2D.y);
 
-    // 5) initial direction p = z
-    p = z;
+    // ---------- initial: w = 0 ----------
+    double t_g0 = MPI_Wtime();
+    zero_kernel<<<grid2D, block2D>>>(d_w, local_nx, local_ny);
+    checkCuda(cudaGetLastError(), "zero_kernel");
+    checkCuda(cudaDeviceSynchronize(), "zero_kernel sync");
+    double t_g1 = MPI_Wtime();
+    time_gpu_total += (t_g1 - t_g0);
 
-    // 6) initial (z, r) —— 改用 GPU dot
+    // r = B
+    t_c0 = MPI_Wtime();
+    checkCuda(cudaMemcpy(d_r, d_B, bytes, cudaMemcpyDeviceToDevice),
+              "copy B->r");
+    t_c1 = MPI_Wtime();
+    time_copy_total += (t_c1 - t_c0);
+
+    // z = D^{-1} r
+    t_g0 = MPI_Wtime();
+    apply_Dinv_kernel<<<grid2D, block2D>>>(d_r, d_a, d_b, d_z,
+                                           local_nx, local_ny, h1, h2);
+    checkCuda(cudaGetLastError(), "apply_Dinv_kernel init");
+    checkCuda(cudaDeviceSynchronize(), "apply_Dinv_kernel init sync");
+    t_g1 = MPI_Wtime();
+    time_gpu_total     += (t_g1 - t_g0);
+    time_precond_total += (t_g1 - t_g0);  // preconditioner time (now GPU)
+
+    // p = z
+    t_g0 = MPI_Wtime();
+    copy_kernel<<<grid2D, block2D>>>(d_z, d_p, local_nx, local_ny);
+    checkCuda(cudaGetLastError(), "copy_kernel");
+    checkCuda(cudaDeviceSynchronize(), "copy_kernel sync");
+    t_g1 = MPI_Wtime();
+    time_gpu_total += (t_g1 - t_g0);
+
+    // (z, r)
     double t_dot0 = MPI_Wtime();
     double local_zr = dot_gpu(d_z, d_r);
     double t_dot1 = MPI_Wtime();
@@ -874,118 +842,118 @@ int gradient_solver_mpi(int M, int N, double delta, int max_iter,
     double zr_old = 0.0;
     MPI_Allreduce(&local_zr, &zr_old, 1, MPI_DOUBLE, MPI_SUM, comm);
 
+    int iter = 0;
+
     for (int k = 1; k <= max_iter; ++k) {
         iter = k;
 
-        // 1) Update halo layers of p (CPU + MPI)
-        double t_comm0 = MPI_Wtime();
-        exchange_halos_2d(p, local_nx, local_ny, Px, Py, rank, comm);
-        double t_comm1 = MPI_Wtime();
-        time_comm_total += (t_comm1 - t_comm0);
+        // halo exchange for p
+        exchange_halos_2d_gpu(d_p, local_nx, local_ny,
+                              Px, Py, rank, comm,
+                              time_comm_total, time_copy_total);
 
-        // 2) Flatten p (including halos) into h_p
-        for (int li = 0; li <= local_nx + 1; ++li) {
-            for (int lj = 0; lj <= local_ny + 1; ++lj) {
-                int idx = li * pitch + lj;
-                h_p[idx] = p[li][lj];
-            }
-        }
-
-        double t0 = MPI_Wtime();
-        checkCuda(cudaMemcpy(d_p, h_p.data(), bytes, cudaMemcpyHostToDevice),
-                  "cudaMemcpy p H2D");
-        double t1 = MPI_Wtime();
-
-        // 3) Ap = A p on GPU
-        apply_A_kernel<<<gridDim, blockDim>>>(d_p, d_a, d_b, d_Ap,
-                                              local_nx, local_ny, h1, h2);
-        checkCuda(cudaGetLastError(), "apply_A_kernel launch");
+        // Ap = A p
+        t_g0 = MPI_Wtime();
+        apply_A_kernel<<<grid2D, block2D>>>(d_p, d_a, d_b, d_Ap,
+                                            local_nx, local_ny, h1, h2);
+        checkCuda(cudaGetLastError(), "apply_A_kernel");
         checkCuda(cudaDeviceSynchronize(), "apply_A_kernel sync");
-        double t2 = MPI_Wtime();
+        t_g1 = MPI_Wtime();
+        time_gpu_total += (t_g1 - t_g0);
 
-        checkCuda(cudaMemcpy(h_Ap.data(), d_Ap, bytes, cudaMemcpyDeviceToHost),
-                  "cudaMemcpy Ap D2H");
-        double t3 = MPI_Wtime();
-
-        time_copy_total += (t1 - t0) + (t3 - t2);
-        time_gpu_total  += (t2 - t1);
-
-        // 4) denom = (Ap, p) —— 改用 GPU dot（在 unflatten 之前算）
+        // denom = (Ap, p)
         t_dot0 = MPI_Wtime();
         double local_den = dot_gpu(d_Ap, d_p);
         t_dot1 = MPI_Wtime();
         time_dot_total += (t_dot1 - t_dot0);
 
         double denom = 0.0;
+        double t_comm0 = MPI_Wtime();
         MPI_Allreduce(&local_den, &denom, 1, MPI_DOUBLE, MPI_SUM, comm);
-        if (std::abs(denom) < 1e-15) break;
+        double t_comm1 = MPI_Wtime();
+        time_comm_total += (t_comm1 - t_comm0);
 
+        if (std::abs(denom) < 1e-15) break;
         double alpha = zr_old / denom;
 
-        // 5) Unflatten interior part of Ap back to Matrix（用于更新 r）
-        for (int li = 1; li <= local_nx; ++li) {
-            for (int lj = 1; lj <= local_ny; ++lj) {
-                int idx = li * pitch + lj;
-                Ap[li][lj] = h_Ap[idx];
+        // update w, r and compute local diff
+        t_g0 = MPI_Wtime();
+        update_w_r_kernel<<<DOT_BLOCKS, DOT_THREADS>>>(
+            d_w, d_r, d_p, d_Ap, alpha,
+            local_nx, local_ny, h1h2, d_partial
+        );
+        checkCuda(cudaGetLastError(), "update_w_r_kernel");
+        checkCuda(cudaDeviceSynchronize(), "update_w_r_kernel sync");
+        t_g1 = MPI_Wtime();
+        time_gpu_total += (t_g1 - t_g0);
+
+        double local_diff = reduce_diff(d_partial);
+        double global_diff = 0.0;
+        t_comm0 = MPI_Wtime();
+        MPI_Allreduce(&local_diff, &global_diff, 1,
+                      MPI_DOUBLE, MPI_SUM, comm);
+        t_comm1 = MPI_Wtime();
+        time_comm_total += (t_comm1 - t_comm0);
+        global_diff = std::sqrt(global_diff);
+
+        if (global_diff < delta) {
+            if (rank == 0) {
+                std::cout << "Converged after " << k
+                          << " iterations (||w(k+1)-w(k)|| < "
+                          << delta << ").\n";
             }
+            break;
         }
 
-        // 6) Update w and r, and accumulate local norm of w(k+1) - w(k)
-        double local_diff = 0.0;
-        for (int li = 1; li <= local_nx; ++li) {
-            for (int lj = 1; lj <= local_ny; ++lj) {
-                double w_old = w[li][lj];
-                w[li][lj] = w_old + alpha * p[li][lj];
-                r[li][lj] -= alpha * Ap[li][lj];
-                double diff = w[li][lj] - w_old;
-                local_diff += diff * diff;
-            }
-        }
+        // z = D^{-1} r
+        t_g0 = MPI_Wtime();
+        apply_Dinv_kernel<<<grid2D, block2D>>>(d_r, d_a, d_b, d_z,
+                                               local_nx, local_ny, h1, h2);
+        checkCuda(cudaGetLastError(), "apply_Dinv_kernel loop");
+        checkCuda(cudaDeviceSynchronize(), "apply_Dinv_kernel loop sync");
+        t_g1 = MPI_Wtime();
+        time_gpu_total     += (t_g1 - t_g0);
+        time_precond_total += (t_g1 - t_g0);
 
-        // 7) z = D^{-1} r (GPU)
-        apply_Dinv_gpu(r, z);
-
-        // 8) zr_new = (z, r) —— 继续用 GPU dot
+        // zr_new = (z, r)
         t_dot0 = MPI_Wtime();
         double local_zr_new = dot_gpu(d_z, d_r);
         t_dot1 = MPI_Wtime();
         time_dot_total += (t_dot1 - t_dot0);
 
         double zr_new = 0.0;
-        MPI_Allreduce(&local_zr_new, &zr_new, 1, MPI_DOUBLE, MPI_SUM, comm);
-
-        // 9) Global convergence check: ||w(k+1) - w(k)||_E < delta
-        double global_diff = 0.0;
-        MPI_Allreduce(&local_diff, &global_diff, 1, MPI_DOUBLE, MPI_SUM, comm);
-        global_diff = std::sqrt(global_diff * h1h2);
-
-        if (global_diff < delta) {
-            if (rank == 0) {
-                std::cout << "Converged after " << k
-                          << " iterations (||w(k+1)-w(k)|| < " << delta << ").\n";
-            }
-            break;
-        }
+        t_comm0 = MPI_Wtime();
+        MPI_Allreduce(&local_zr_new, &zr_new, 1,
+                      MPI_DOUBLE, MPI_SUM, comm);
+        t_comm1 = MPI_Wtime();
+        time_comm_total += (t_comm1 - t_comm0);
 
         double beta = zr_new / zr_old;
         zr_old = zr_new;
 
-        // 10) p = z + beta * p
-        for (int li = 1; li <= local_nx; ++li)
-            for (int lj = 1; lj <= local_ny; ++lj)
-                p[li][lj] = z[li][lj] + beta * p[li][lj];
+        // p = z + beta * p
+        t_g0 = MPI_Wtime();
+        update_p_kernel<<<grid2D, block2D>>>(
+            d_p, d_z, beta, local_nx, local_ny
+        );
+        checkCuda(cudaGetLastError(), "update_p_kernel");
+        checkCuda(cudaDeviceSynchronize(), "update_p_kernel sync");
+        t_g1 = MPI_Wtime();
+        time_gpu_total += (t_g1 - t_g0);
     }
 
-    // Free device memory
-    checkCuda(cudaFree(d_a),  "cudaFree d_a");
-    checkCuda(cudaFree(d_b),  "cudaFree d_b");
-    checkCuda(cudaFree(d_p),  "cudaFree d_p");
-    checkCuda(cudaFree(d_Ap), "cudaFree d_Ap");
-    checkCuda(cudaFree(d_r),  "cudaFree d_r");
-    checkCuda(cudaFree(d_z),  "cudaFree d_z");
-    checkCuda(cudaFree(d_partial), "cudaFree d_partial");
+    // free device memory
+    checkCuda(cudaFree(d_a),  "free d_a");
+    checkCuda(cudaFree(d_b),  "free d_b");
+    checkCuda(cudaFree(d_B),  "free d_B");
+    checkCuda(cudaFree(d_w),  "free d_w");
+    checkCuda(cudaFree(d_r),  "free d_r");
+    checkCuda(cudaFree(d_z),  "free d_z");
+    checkCuda(cudaFree(d_p),  "free d_p");
+    checkCuda(cudaFree(d_Ap), "free d_Ap");
+    checkCuda(cudaFree(d_partial), "free d_partial");
 
-    // Reduce timings across all ranks (take max as representative)
+    // reduce timings over ranks (max)
     double gpu_total_max     = 0.0;
     double copy_total_max    = 0.0;
     double comm_total_max    = 0.0;
@@ -998,7 +966,6 @@ int gradient_solver_mpi(int M, int N, double delta, int max_iter,
     MPI_Reduce(&time_precond_total, &precond_total_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     MPI_Reduce(&time_dot_total,     &dot_total_max,     1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
-    // Print timing info on rank 0
     if (rank == 0) {
         std::cout << "   GPU compute time (Ap + D^{-1}r, max over ranks) ~ "
                   << gpu_total_max  << " s\n";

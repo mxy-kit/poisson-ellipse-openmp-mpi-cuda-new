@@ -424,6 +424,85 @@ void dot_kernel(const double* x,
     // 带上 h1*h2（积分权重）
     partial[tid] = sum * h1h2;
 }
+__global__
+void zero_kernel(double* w, int local_nx, int local_ny)
+{
+    int li = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int lj = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    if (li > local_nx || lj > local_ny) return;
+
+    int pitch = local_ny + 2;
+    int idx   = li * pitch + lj;
+    w[idx] = 0.0;
+}
+
+// p = z
+__global__
+void copy_kernel(const double* z, double* p,
+                 int local_nx, int local_ny)
+{
+    int li = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int lj = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    if (li > local_nx || lj > local_ny) return;
+
+    int pitch = local_ny + 2;
+    int idx   = li * pitch + lj;
+    p[idx] = z[idx];
+}
+
+// update w, r and accumulate ||w_new - w_old||^2
+__global__
+void update_w_r_kernel(double* w,
+                       double* r,
+                       const double* p,
+                       const double* Ap,
+                       double alpha,
+                       int local_nx, int local_ny,
+                       double h1h2,
+                       double* partial_diff)
+{
+    int pitch = local_ny + 2;
+    int interior_size = local_nx * local_ny;
+
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    double sum = 0.0;
+
+    for (int k = tid; k < interior_size; k += stride) {
+        int li  = k / local_ny + 1;
+        int lj  = k % local_ny + 1;
+        int idx = li * pitch + lj;
+
+        double w_old = w[idx];
+        double w_new = w_old + alpha * p[idx];
+        double r_new = r[idx] - alpha * Ap[idx];
+
+        w[idx] = w_new;
+        r[idx] = r_new;
+
+        double diff = w_new - w_old;
+        sum += diff * diff;
+    }
+    partial_diff[tid] = sum * h1h2;
+}
+
+// p = z + beta * p
+__global__
+void update_p_kernel(double* p,
+                     const double* z,
+                     double beta,
+                     int local_nx, int local_ny)
+{
+    int li = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int lj = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    if (li > local_nx || lj > local_ny) return;
+
+    int pitch = local_ny + 2;
+    int idx   = li * pitch + lj;
+    p[idx] = z[idx] + beta * p[idx];
+}
+
 
 /*
  * Preconditioned Conjugate Gradient (PCG) solver with MPI + CUDA.
